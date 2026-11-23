@@ -1,0 +1,20 @@
+# Three jobs: build, test, bench. The source is copied into the image, so
+# nothing the container does changes the files on the Mac, except the bench
+# job, which copies its results into ./bench-out.
+services:
+  build:
+    build: .
+    command: ["bash", "-c", "make clean && make mini-redis mini-redis-asan tests/unit"]
+  test:
+    build: .
+    command: ["bash", "-c", "make clean && make test"]
+  bench:
+    build: .
+    volumes:
+      - ./bench-out:/out
+    command: ["bash", "-c", "make clean && make bench && cp bench-results.json /out/bench-results.json"]
+  run:
+    build: .
+    ports:
+      - "127.0.0.1:6399:6399"
+    command: ["bash", "-c", "make mini-redis && ./mini-redis --port 6399 --bind 0.0.0.0"]

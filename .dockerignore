@@ -1,0 +1,7 @@
+mini-redis
+mini-redis-asan
+tests/unit
+bench-out
+*.aof
+__pycache__
+.pytest_cache
