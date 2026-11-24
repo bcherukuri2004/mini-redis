@@ -21,7 +21,7 @@ tests/unit: tests/unit.c $(CORE) src/*.h
 # all against the sanitizer build.
 test: tests/unit mini-redis-asan
 	./tests/unit
-	python3 -m pytest -q tests/test_integration.py tests/test_differential.py tests/test_replication.py
+	python3 -m pytest -q tests/test_integration.py tests/test_differential.py tests/test_replication.py tests/test_replication_vs_redis.py
 
 bench: mini-redis
 	python3 tests/bench.py

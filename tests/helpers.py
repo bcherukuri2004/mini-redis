@@ -173,12 +173,12 @@ def start_mini(aof=None, fsync="everysec", port=None, extra=()):
     return srv
 
 
-def start_real_redis():
+def start_real_redis(port=None, extra=()):
     """Real Redis in its own empty folder. Redis writes dump.rdb into its
     folder when a replica asks it for a copy, and loads dump.rdb at startup,
     so sharing a folder would leak keys from one test into the next."""
-    port = free_port()
+    port = port or free_port()
     workdir = tempfile.mkdtemp(prefix="real-redis-")
     argv = ["redis-server", "--port", str(port), "--save", "", "--appendonly", "no", "--bind", "127.0.0.1",
-            "--dir", workdir]
+            "--dir", workdir] + list(extra)
     return Server(argv, port)
