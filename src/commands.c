@@ -41,13 +41,18 @@ static int opt_is(const arg_t *a, const char *name) {
     return a->len == n && strncasecmp(a->p, name, n) == 0;
 }
 
-/* Find a key, deleting it first if it has expired (lazy expiry). While the
- * append only file is being replayed nothing expires, so the replay sees
- * exactly the state the original run saw. */
+/* While the append only file is replayed, or a command from our primary is
+ * applied, nothing expires: the command must see exactly the state that
+ * produced it. */
+static int expiry_paused(void) { return server.loading || server.applying; }
+
+/* Find a key, deleting it first if it has expired (lazy expiry). A replica
+ * only hides an expired key; the primary decides when it is deleted. */
 static entry_t *lookup_key(const char *k, size_t kl) {
     entry_t *e = dict_find(server.db, k, kl);
     if (!e) return NULL;
-    if (e->expire >= 0 && !server.loading && e->expire <= now_ms()) {
+    if (e->expire >= 0 && !expiry_paused() && e->expire <= now_ms()) {
+        if (server.repl_state != REPL_NONE) return NULL;
         arg_t del[2] = {{"DEL", 3}, {k, kl}};
         aof_feed(del, 2);
         dict_remove(server.db, k, kl);
@@ -115,6 +120,7 @@ static void cmd_info(client_t *c, args_t *a) {
                 server.total_conns, server.total_cmds);
     buf_appendf(&b, "# Persistence\r\naof_enabled:%d\r\naof_current_size:%lld\r\n\r\n", server.aof_fd >= 0,
                 server.aof_size);
+    repl_info(&b);
     buf_appendf(&b, "# Keyspace\r\ndb0:keys=%zu\r\n", server.db->used);
     reply_bulk(c, buf_ptr(&b), buf_used(&b));
     buf_free(&b);
@@ -123,6 +129,7 @@ static void cmd_info(client_t *c, args_t *a) {
 static void cmd_rewriteaof(client_t *c, args_t *a) {
     (void)a;
     if (server.aof_fd < 0) return reply_error(c, "ERR append only file is not enabled");
+    if (server.repl_state == REPL_LOADING) return reply_error(c, "ERR a full sync from the primary is in progress");
     if (aof_rewrite() != 0) return reply_error(c, "ERR append only file rewrite failed");
     reply_simple(c, "OK");
 }
@@ -289,7 +296,7 @@ static void expire_generic(client_t *c, args_t *a, int seconds, int absolute) {
     }
     entry_t *e = lookup_key(k->p, k->len);
     if (!e) return reply_int(c, 0);
-    if (n <= now && !server.loading) {
+    if (n <= now && !expiry_paused()) {
         dict_remove(server.db, k->p, k->len);
         arg_t del[2] = {{"DEL", 3}, *k};
         aof_feed(del, 2);
@@ -363,6 +370,52 @@ static void cmd_keys(client_t *c, args_t *a) {
     free(hits);
 }
 
+/* ---------- replication ---------- */
+
+/* REPLICAOF host port, or REPLICAOF NO ONE. The messages match Redis 7. */
+static void cmd_replicaof(client_t *c, args_t *a) {
+    if (opt_is(&a->v[1], "NO") && opt_is(&a->v[2], "ONE")) {
+        repl_set_none();
+        return reply_simple(c, "OK");
+    }
+    long long port;
+    if (!str2ll(a->v[2].p, a->v[2].len, &port) || port < 0 || port > 65535)
+        return reply_error(c, "ERR Invalid master port");
+    if (server.nreplicas > 0)
+        return reply_error(c, "ERR this server has replicas attached; chained replication is not supported");
+    if (a->v[1].len == 0 || a->v[1].len > 255) return reply_error(c, "ERR Invalid master host");
+    char *host = xmemdup(a->v[1].p, a->v[1].len);
+    if (server.repl_state != REPL_NONE && server.primary_port == port && !strcmp(server.primary_host, host)) {
+        free(host);
+        return reply_simple(c, "OK Already connected to specified master");
+    }
+    repl_set_primary(host, (int)port);
+    free(host);
+    reply_simple(c, "OK");
+}
+
+/* A replica asks for a full copy followed by the live stream. */
+static void cmd_sync(client_t *c, args_t *a) {
+    (void)a;
+    if (server.repl_state != REPL_NONE)
+        return reply_error(c, "ERR this server is a replica; chained replication is not supported");
+    if (c->is_replica) return reply_error(c, "ERR already syncing");
+    repl_start_sync(c);
+}
+
+/* REPLCONF ACK <offset> from a replica gets no reply, like in Redis. */
+static void cmd_replconf(client_t *c, args_t *a) {
+    if (c->is_replica && a->n == 3 && opt_is(&a->v[1], "ACK")) {
+        long long off;
+        if (str2ll(a->v[2].p, a->v[2].len, &off) && off >= 0) {
+            c->ack_offset = off;
+            c->ack_ms = now_ms();
+        }
+        return;
+    }
+    reply_simple(c, "OK");
+}
+
 /* ---------- command table ---------- */
 
 typedef void (*cmd_fn)(client_t *c, args_t *a);
@@ -370,20 +423,23 @@ typedef struct {
     const char *name;
     cmd_fn fn;
     int arity; /* exact count including the name; negative means at least */
+    int write; /* changes data, so a replica refuses it from normal clients */
 } cmd_t;
 
 /* Hot commands first. */
 static const cmd_t cmd_list[] = {
-    {"GET", cmd_get, 2},           {"SET", cmd_set, -3},         {"DEL", cmd_del, -2},
-    {"EXISTS", cmd_exists, -2},    {"INCR", cmd_incr, 2},        {"DECR", cmd_decr, 2},
-    {"INCRBY", cmd_incrby, 3},     {"DECRBY", cmd_decrby, 3},    {"MGET", cmd_mget, -2},
-    {"MSET", cmd_mset, -3},        {"EXPIRE", cmd_expire, 3},    {"PEXPIRE", cmd_pexpire, 3},
-    {"EXPIREAT", cmd_expireat, 3}, {"PEXPIREAT", cmd_pexpireat, 3}, {"TTL", cmd_ttl, 2},
-    {"PTTL", cmd_pttl, 2},         {"PERSIST", cmd_persist, 2},  {"TYPE", cmd_type, 2},
-    {"KEYS", cmd_keys, 2},         {"DBSIZE", cmd_dbsize, 1},    {"FLUSHALL", cmd_flushall, -1},
-    {"PING", cmd_ping, -1},        {"ECHO", cmd_echo, 2},        {"QUIT", cmd_quit, 1},
-    {"SELECT", cmd_select, 2},     {"INFO", cmd_info, -1},       {"COMMAND", cmd_command, -1},
-    {"CONFIG", cmd_config, -2},    {"CLIENT", cmd_client, -2},   {"REWRITEAOF", cmd_rewriteaof, 1},
+    {"GET", cmd_get, 2, 0},           {"SET", cmd_set, -3, 1},         {"DEL", cmd_del, -2, 1},
+    {"EXISTS", cmd_exists, -2, 0},    {"INCR", cmd_incr, 2, 1},        {"DECR", cmd_decr, 2, 1},
+    {"INCRBY", cmd_incrby, 3, 1},     {"DECRBY", cmd_decrby, 3, 1},    {"MGET", cmd_mget, -2, 0},
+    {"MSET", cmd_mset, -3, 1},        {"EXPIRE", cmd_expire, 3, 1},    {"PEXPIRE", cmd_pexpire, 3, 1},
+    {"EXPIREAT", cmd_expireat, 3, 1}, {"PEXPIREAT", cmd_pexpireat, 3, 1}, {"TTL", cmd_ttl, 2, 0},
+    {"PTTL", cmd_pttl, 2, 0},         {"PERSIST", cmd_persist, 2, 1},  {"TYPE", cmd_type, 2, 0},
+    {"KEYS", cmd_keys, 2, 0},         {"DBSIZE", cmd_dbsize, 1, 0},    {"FLUSHALL", cmd_flushall, -1, 1},
+    {"PING", cmd_ping, -1, 0},        {"ECHO", cmd_echo, 2, 0},        {"QUIT", cmd_quit, 1, 0},
+    {"SELECT", cmd_select, 2, 0},     {"INFO", cmd_info, -1, 0},       {"COMMAND", cmd_command, -1, 0},
+    {"CONFIG", cmd_config, -2, 0},    {"CLIENT", cmd_client, -2, 0},   {"REWRITEAOF", cmd_rewriteaof, 1, 0},
+    {"REPLICAOF", cmd_replicaof, 3, 0}, {"SLAVEOF", cmd_replicaof, 3, 0}, {"SYNC", cmd_sync, 1, 0},
+    {"REPLCONF", cmd_replconf, -2, 0},
 };
 
 static dict_t *cmd_table;
@@ -422,6 +478,10 @@ void exec_command(client_t *c) {
     }
     if ((cmd->arity > 0 && (int)a->n != cmd->arity) || (cmd->arity < 0 && (int)a->n < -cmd->arity)) {
         reply_wrong_args(c, &a->v[0]);
+        return;
+    }
+    if (cmd->write && server.repl_state != REPL_NONE && !c->is_primary && c->fd >= 0) {
+        reply_error(c, "READONLY You can't write against a read only replica.");
         return;
     }
     server.total_cmds++;

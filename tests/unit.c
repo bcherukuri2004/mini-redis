@@ -8,6 +8,7 @@
 
 #include "buf.h"
 #include "dict.h"
+#include "replproto.h"
 #include "resp.h"
 #include "util.h"
 
@@ -250,12 +251,176 @@ static void test_resp(void) {
     args_free(&a);
 }
 
+
+/* ---------- replication pieces ---------- */
+
+/* Parse a full copy back into a fresh table, the way a replica applies it. */
+static dict_t *apply_snapshot(buf_t *b, long long *cmds) {
+    dict_t *d = dict_create();
+    args_t a = {0};
+    size_t off = 0;
+    *cmds = 0;
+    while (off < buf_used(b)) {
+        size_t used;
+        const char *err = NULL;
+        resp_status st = resp_parse(buf_ptr(b) + off, buf_used(b) - off, &a, &used, &err);
+        CHECK(st == RESP_OK);
+        if (st != RESP_OK) break;
+        (*cmds)++;
+        if (a.n == 3 && a.v[0].len == 3 && !memcmp(a.v[0].p, "SET", 3)) {
+            dict_set(d, a.v[1].p, a.v[1].len, a.v[2].p, a.v[2].len);
+        } else if (a.n == 3 && a.v[0].len == 9 && !memcmp(a.v[0].p, "PEXPIREAT", 9)) {
+            entry_t *e = dict_find(d, a.v[1].p, a.v[1].len);
+            CHECK(e != NULL); /* PEXPIREAT always follows the SET of the same key */
+            long long at;
+            CHECK(str2ll(a.v[2].p, a.v[2].len, &at));
+            if (e) e->expire = at;
+        } else {
+            CHECK(!"unexpected command in full copy");
+        }
+        off += used;
+    }
+    args_free(&a);
+    return d;
+}
+
+static int count_flush_calls;
+static buf_t flushed;
+static int collect(buf_t *b, void *ud) {
+    (void)ud;
+    count_flush_calls++;
+    buf_append(&flushed, buf_ptr(b), buf_used(b));
+    buf_consume(b, buf_used(b));
+    return 0;
+}
+static int fail_flush(buf_t *b, void *ud) {
+    (void)b;
+    (void)ud;
+    return -1;
+}
+
+static void test_snapshot(void) {
+    long long now = 1000000, cmds;
+    buf_t b;
+
+    /* Empty table: nothing at all. */
+    dict_t *d = dict_create();
+    buf_init(&b);
+    CHECK(snapshot_encode(d, now, &b, 0, NULL, NULL) == 0);
+    CHECK(buf_used(&b) == 0);
+
+    /* Binary keys and values, empty value, live and expired TTLs. */
+    dict_set(d, "plain", 5, "v", 1);
+    dict_set(d, "bin\0\r\nkey", 9, "\0\r\n$*", 5);
+    dict_set(d, "empty", 5, "", 0);
+    dict_set(d, "ttl", 3, "x", 1)->expire = now + 5000;
+    dict_set(d, "gone", 4, "x", 1)->expire = now;      /* expires exactly now: skipped */
+    dict_set(d, "gone2", 5, "x", 1)->expire = now - 1; /* already past: skipped */
+    CHECK(snapshot_encode(d, now, &b, 0, NULL, NULL) == 4);
+    dict_t *r = apply_snapshot(&b, &cmds);
+    CHECK(cmds == 5); /* 4 SET + 1 PEXPIREAT */
+    CHECK(r->used == 4);
+    entry_t *e = dict_find(r, "bin\0\r\nkey", 9);
+    CHECK(e && e->vlen == 5 && !memcmp(e->val, "\0\r\n$*", 5) && e->expire == -1);
+    e = dict_find(r, "empty", 5);
+    CHECK(e && e->vlen == 0);
+    e = dict_find(r, "ttl", 3);
+    CHECK(e && e->expire == now + 5000);
+    CHECK(!dict_find(r, "gone", 4) && !dict_find(r, "gone2", 5));
+    dict_destroy(r);
+    dict_destroy(d);
+    buf_free(&b);
+
+    /* 50,000 keys through small chunks: every key arrives exactly once and
+     * the chunk size is respected. */
+    d = dict_create();
+    char k[32], v[32];
+    for (int i = 0; i < 50000; i++) {
+        int kl = snprintf(k, sizeof k, "key:%d", i), vl = snprintf(v, sizeof v, "%d", i * 7);
+        entry_t *x = dict_set(d, k, (size_t)kl, v, (size_t)vl);
+        if (i % 10 == 0) x->expire = now + i + 1;
+    }
+    buf_init(&b);
+    buf_init(&flushed);
+    count_flush_calls = 0;
+    CHECK(snapshot_encode(d, now, &b, 4096, collect, NULL) == 50000);
+    CHECK(buf_used(&b) == 0);
+    CHECK(count_flush_calls > 100);
+    r = apply_snapshot(&flushed, &cmds);
+    CHECK(cmds == 55000);
+    CHECK(r->used == 50000);
+    int bad = 0;
+    for (int i = 0; i < 50000; i++) {
+        int kl = snprintf(k, sizeof k, "key:%d", i), vl = snprintf(v, sizeof v, "%d", i * 7);
+        e = dict_find(r, k, (size_t)kl);
+        if (!e || e->vlen != (size_t)vl || memcmp(e->val, v, (size_t)vl) ||
+            e->expire != (i % 10 == 0 ? now + i + 1 : -1))
+            bad++;
+    }
+    CHECK(bad == 0);
+    dict_destroy(r);
+
+    /* A failing writer is reported. */
+    buf_consume(&b, buf_used(&b));
+    CHECK(snapshot_encode(d, now, &b, 1, fail_flush, NULL) == -1);
+    dict_destroy(d);
+    buf_free(&b);
+    buf_free(&flushed);
+}
+
+static int fs(const char *s, long long *off, size_t *used) { return parse_fullsync_line(s, strlen(s), off, used); }
+
+static void test_fullsync_line(void) {
+    long long off = -7;
+    size_t used = 0;
+    CHECK(fs("+FULLSYNC 0\r\n", &off, &used) == 1 && off == 0 && used == 13);
+    CHECK(fs("+FULLSYNC 123456\r\nSET...", &off, &used) == 1 && off == 123456 && used == 18);
+    CHECK(fs("+FULLSYNC 9223372036854775807\r\n", &off, &used) == 1 && off == LLONG_MAX);
+    /* Not enough bytes yet: wait, at every split point of a valid line. */
+    const char *full = "+FULLSYNC 42\r\n";
+    for (size_t i = 0; i < strlen(full); i++) CHECK(parse_fullsync_line(full, i, &off, &used) == 0);
+    /* Wrong from the first byte: a real Redis primary sends a binary
+     * snapshot that starts with '$', and errors start with '-'. */
+    CHECK(fs("$175\r\nREDIS0010", &off, &used) == -1);
+    CHECK(fs("-ERR unknown command 'SYNC'\r\n", &off, &used) == -1);
+    CHECK(fs("+", &off, &used) == 0);
+    CHECK(fs("+F", &off, &used) == 0);
+    CHECK(fs("+FX", &off, &used) == -1);
+    CHECK(fs("+OK\r\n", &off, &used) == -1);
+    CHECK(fs("+FULLSYNC\r\n", &off, &used) == -1);
+    CHECK(fs("+FULLSYNC \r\n", &off, &used) == -1);
+    CHECK(fs("+FULLSYNC -1\r\n", &off, &used) == -1);
+    CHECK(fs("+FULLSYNC 12a\r\n", &off, &used) == -1);
+    CHECK(fs("+FULLSYNC 012\r\n", &off, &used) == -1);
+    CHECK(fs("+FULLSYNC 9223372036854775808\r\n", &off, &used) == -1);
+    CHECK(fs("+FULLSYNC 1\n", &off, &used) == -1);
+    CHECK(fs("+FULLSYNC 1 \r\n", &off, &used) == -1);
+    /* A line that never ends is rejected once it is clearly too long. */
+    char longline[200];
+    memset(longline, '9', sizeof longline);
+    memcpy(longline, "+FULLSYNC ", 10);
+    CHECK(parse_fullsync_line(longline, sizeof longline, &off, &used) == -1);
+    CHECK(parse_fullsync_line(longline, 30, &off, &used) == 0);
+    /* Every possible single byte after the prefix is either a digit, an
+     * end of line, or rejected; nothing crashes. */
+    for (int ch = 0; ch < 256; ch++) {
+        char line[16] = "+FULLSYNC 5?\r\n";
+        line[11] = (char)ch;
+        int rc = parse_fullsync_line(line, 14, &off, &used);
+        if (ch >= '0' && ch <= '9') CHECK(rc == 1 && off == 50 + (ch - '0'));
+        else if (ch == '\n') CHECK(rc == -1);
+        else CHECK(rc == -1);
+    }
+}
+
 int main(void) {
     test_str2ll();
     test_glob();
     test_buf();
     test_dict();
     test_resp();
+    test_snapshot();
+    test_fullsync_line();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "replproto.h"
 #include "server.h"
 
 /* The append only file (AOF) is a log of every command that changed data,
@@ -26,9 +27,14 @@ static int write_all(int fd, const char *p, size_t n) {
     return 0;
 }
 
+/* Every change goes through here: into the log when persistence is on, and
+ * to every connected replica. */
 void aof_feed(const arg_t *v, size_t n) {
-    if (server.aof_fd < 0 || server.loading) return;
-    resp_encode(&server.aof_buf, v, n);
+    if (server.loading) return;
+    /* The full copy from a primary is not logged command by command; when it
+     * is complete the log is rewritten from it in one go (see repl.c). */
+    if (server.aof_fd >= 0 && server.repl_state != REPL_LOADING) resp_encode(&server.aof_buf, v, n);
+    repl_feed(v, n);
 }
 
 /* Replay the file through the normal command code using a fake client with
@@ -148,8 +154,15 @@ void aof_cron(void) {
     }
 }
 
-static int flush_chunk(int fd, buf_t *b) {
-    int rc = write_all(fd, buf_ptr(b), buf_used(b));
+typedef struct {
+    int fd;
+    long long total;
+} rewrite_out_t;
+
+static int flush_chunk(buf_t *b, void *ud) {
+    rewrite_out_t *o = ud;
+    o->total += (long long)buf_used(b);
+    int rc = write_all(o->fd, buf_ptr(b), buf_used(b));
     buf_consume(b, buf_used(b));
     return rc;
 }
@@ -167,32 +180,9 @@ int aof_rewrite(void) {
 
     buf_t b;
     buf_init(&b);
-    long long now = now_ms(), total = 0;
-    int rc = 0;
-    for (size_t i = 0; i < server.db->size && rc == 0; i++) {
-        for (entry_t *e = server.db->tab[i]; e; e = e->next) {
-            if (e->expire >= 0 && e->expire <= now) continue;
-            arg_t set[3] = {{"SET", 3}, {e->key, e->klen}, {e->val, e->vlen}};
-            resp_encode(&b, set, 3);
-            if (e->expire >= 0) {
-                char nb[32];
-                int nl = snprintf(nb, sizeof nb, "%lld", e->expire);
-                arg_t ex[3] = {{"PEXPIREAT", 9}, {e->key, e->klen}, {nb, (size_t)nl}};
-                resp_encode(&b, ex, 3);
-            }
-            if (buf_used(&b) >= (1 << 20)) {
-                total += (long long)buf_used(&b);
-                if (flush_chunk(fd, &b) != 0) {
-                    rc = -1;
-                    break;
-                }
-            }
-        }
-    }
-    if (rc == 0) {
-        total += (long long)buf_used(&b);
-        rc = flush_chunk(fd, &b);
-    }
+    rewrite_out_t o = {fd, 0};
+    int rc = snapshot_encode(server.db, now_ms(), &b, 1 << 20, flush_chunk, &o) < 0 ? -1 : 0;
+    long long total = o.total;
     buf_free(&b);
     if (rc == 0 && fdatasync(fd) != 0) rc = -1;
     if (rc == 0 && rename(tmp, server.aof_path) != 0) rc = -1;

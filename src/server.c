@@ -36,7 +36,7 @@ static void epoll_set(client_t *c, int op, uint32_t events) {
     epoll_ctl(server.epfd, op, c->fd, &ev);
 }
 
-static client_t *client_create(int fd) {
+client_t *client_create(int fd) {
     client_t *c = xcalloc(1, sizeof *c);
     c->fd = fd;
     epoll_set(c, EPOLL_CTL_ADD, EPOLLIN);
@@ -48,9 +48,10 @@ static client_t *client_create(int fd) {
 /* A client can be closed while we are still working through a batch of
  * epoll events that mention it, so closing only marks it and closes the
  * socket. The memory is freed once the batch is done. */
-static void client_close(client_t *c) {
+void client_close(client_t *c) {
     if (c->closing) return;
     c->closing = 1;
+    if (c->is_replica || c->is_primary) repl_on_close(c);
     epoll_ctl(server.epfd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
     c->fd = -1;
@@ -70,7 +71,7 @@ static void free_closed_clients(void) {
     }
 }
 
-static void add_pending(client_t *c) {
+void add_pending(client_t *c) {
     if (c->pending) return;
     if (npending == cap_pending) {
         cap_pending = cap_pending ? cap_pending * 2 : 64;
@@ -78,6 +79,13 @@ static void add_pending(client_t *c) {
     }
     c->pending = 1;
     pending[npending++] = c;
+}
+
+/* Ask epoll to report when the socket can take more output. */
+void client_watch_write(client_t *c) {
+    if (c->closing || c->want_write) return;
+    c->want_write = 1;
+    epoll_set(c, EPOLL_CTL_MOD, EPOLLIN | EPOLLOUT);
 }
 
 /* Write as much queued output as the socket will take. If it fills up,
@@ -109,6 +117,7 @@ static void client_flush(client_t *c) {
 }
 
 static void process_input(client_t *c) {
+    if (c->is_primary) return repl_process_link(c);
     while (!c->closing && !c->close_after_reply && buf_used(&c->in) > 0) {
         size_t consumed;
         const char *err = NULL;
@@ -124,7 +133,8 @@ static void process_input(client_t *c) {
     }
     if (buf_used(&c->in) > RESP_MAX_BULK + (1u << 20)) client_close(c);
     if (c->closing) return;
-    if (buf_used(&c->out) > MAX_OUTPUT_BYTES) {
+    /* A replica's output is limited separately, by repl_feed. */
+    if (!c->is_replica && buf_used(&c->out) > MAX_OUTPUT_BYTES) {
         client_close(c);
         return;
     }
@@ -177,8 +187,11 @@ static void active_expire(void) {
 }
 
 static void cron(void) {
-    active_expire();
+    /* A replica never expires keys on its own; it waits for the primary's
+     * DEL so both sides always agree. Reads still hide expired keys. */
+    if (server.repl_state == REPL_NONE) active_expire();
     aof_cron();
+    repl_cron();
 }
 
 /* ---------- setup ---------- */
@@ -211,10 +224,13 @@ static int listen_on(const char *addr, int port) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s [--port N] [--bind ADDR] [--aof FILE] [--fsync always|everysec|no]\n"
+            "          [--replicaof HOST:PORT] [--replbuf BYTES]\n"
             "  --port N       TCP port (default 6399)\n"
             "  --bind ADDR    IPv4 address to listen on (default 127.0.0.1)\n"
             "  --aof FILE     keep an append only file for persistence (default: off)\n"
-            "  --fsync MODE   when to flush the file to disk: always, everysec (default), no\n",
+            "  --fsync MODE   when to flush the file to disk: always, everysec (default), no\n"
+            "  --replicaof HOST:PORT  start as a replica of that primary\n"
+            "  --replbuf BYTES        drop a replica whose unsent changes pass this (default 256 MB)\n",
             prog);
 }
 
@@ -223,7 +239,8 @@ int main(int argc, char **argv) {
     server.bind_addr = "127.0.0.1";
     server.aof_fd = -1;
     server.fsync_policy = FSYNC_EVERYSEC;
-    const char *aof_path = NULL;
+    server.replbuf_limit = MAX_OUTPUT_BYTES;
+    const char *aof_path = NULL, *replicaof = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) {
@@ -232,6 +249,13 @@ int main(int argc, char **argv) {
             server.bind_addr = argv[++i];
         } else if (!strcmp(argv[i], "--aof") && i + 1 < argc) {
             aof_path = argv[++i];
+        } else if (!strcmp(argv[i], "--replicaof") && i + 1 < argc) {
+            replicaof = argv[++i];
+        } else if (!strcmp(argv[i], "--replbuf") && i + 1 < argc) {
+            long long n;
+            const char *v = argv[++i];
+            if (!str2ll(v, strlen(v), &n) || n < 1024) return usage(argv[0]), 2;
+            server.replbuf_limit = (size_t)n;
         } else if (!strcmp(argv[i], "--fsync") && i + 1 < argc) {
             const char *m = argv[++i];
             if (!strcmp(m, "always")) server.fsync_policy = FSYNC_ALWAYS;
@@ -265,6 +289,17 @@ int main(int argc, char **argv) {
     epoll_ctl(server.epfd, EPOLL_CTL_ADD, server.listenfd, &lev);
     log_msg("mini redis %s ready on %s:%d%s", MINI_VERSION, server.bind_addr, server.port,
             aof_path ? " (persistence on)" : " (in memory only)");
+    if (replicaof) {
+        const char *colon = strrchr(replicaof, ':');
+        long long rp;
+        if (!colon || colon == replicaof || !str2ll(colon + 1, strlen(colon + 1), &rp) || rp < 0 || rp > 65535) {
+            log_msg("--replicaof wants HOST:PORT, got %s", replicaof);
+            return 2;
+        }
+        char *host = xmemdup(replicaof, (size_t)(colon - replicaof));
+        repl_set_primary(host, (int)rp);
+        free(host);
+    }
 
     struct epoll_event events[MAX_EVENTS];
     long long last_cron = mono_us();
@@ -280,6 +315,10 @@ int main(int argc, char **argv) {
             uint32_t ev = events[i].events;
             if (ev & (EPOLLERR | EPOLLHUP)) {
                 client_close(c);
+                continue;
+            }
+            if (c->is_primary && server.repl_state == REPL_CONNECTING) {
+                if (ev & EPOLLOUT) repl_on_writable(c);
                 continue;
             }
             if (ev & EPOLLIN) client_read(c);

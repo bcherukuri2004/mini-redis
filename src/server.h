@@ -18,10 +18,24 @@ typedef struct client {
     unsigned pending : 1;           /* queued to have its output written */
     unsigned want_write : 1;        /* epoll is watching for writability */
     unsigned close_after_reply : 1; /* QUIT or protocol error */
+    unsigned is_replica : 1;        /* on a primary: this connection is a replica */
+    unsigned is_primary : 1;        /* on a replica: this connection is our link to the primary */
+    long long ack_offset;           /* on a primary: last offset this replica reported */
+    long long ack_ms;               /* when it reported it */
     struct client *next_closing;
 } client_t;
 
 enum { FSYNC_NO = 0, FSYNC_EVERYSEC = 1, FSYNC_ALWAYS = 2 };
+
+/* Where a replica is in talking to its primary. */
+enum {
+    REPL_NONE = 0,     /* not a replica */
+    REPL_DISCONNECTED, /* a replica, waiting to (re)connect */
+    REPL_CONNECTING,   /* TCP connect in progress */
+    REPL_HANDSHAKE,    /* sent SYNC, waiting for "+FULLSYNC <offset>" */
+    REPL_LOADING,      /* receiving the full copy */
+    REPL_ONLINE        /* copy done, applying the live stream */
+};
 
 typedef struct {
     dict_t *db;
@@ -40,6 +54,30 @@ typedef struct {
     long long aof_size;
     buf_t aof_buf; /* commands run this loop iteration, not yet written */
     int loading;   /* replaying the append only file at startup */
+
+    /* replication, primary side */
+    client_t **replicas;
+    size_t nreplicas, cap_replicas;
+    long long repl_offset;          /* bytes of changes sent to replicas so far */
+    size_t replbuf_limit;           /* cut off a replica whose unsent output passes this */
+    long long last_snapshot_us;     /* time to build the last full copy */
+    long long last_snapshot_keys;
+    unsigned long long replicas_dropped_slow;
+
+    /* replication, replica side */
+    int repl_state;                 /* REPL_NONE when this server is a primary */
+    char *primary_host;
+    int primary_port;
+    client_t *primary;              /* link to the primary, NULL when not connected */
+    dict_t *sync_db;                /* the incoming full copy, swapped in when complete */
+    long long replica_offset;       /* bytes of the live stream applied so far */
+    long long repl_attempt_ms;      /* last connect attempt */
+    long long repl_last_io_ms;      /* last byte received from the primary */
+    long long sync_start_us;
+    long long last_sync_us;         /* time the last full copy took, end to end */
+    long long last_sync_keys;
+    unsigned long long full_syncs;
+    int applying;                   /* running a command that came from the primary */
 } server_t;
 
 extern server_t server;
@@ -61,5 +99,22 @@ void aof_before_sleep(void); /* write buffered commands, fsync if policy says so
 void aof_cron(void);         /* once per cron tick: handles the everysec fsync */
 int aof_rewrite(void);
 void aof_close(void);
+
+/* server.c, used by replication */
+client_t *client_create(int fd);
+void client_close(client_t *c);
+void add_pending(client_t *c);
+void client_watch_write(client_t *c);
+
+/* repl.c */
+void repl_feed(const arg_t *v, size_t n);         /* send a change to every replica */
+void repl_cron(void);                             /* reconnects, heartbeats, acks */
+void repl_on_close(client_t *c);                  /* a replica or primary link closed */
+void repl_on_writable(client_t *c);               /* primary link finished connecting */
+void repl_process_link(client_t *c);              /* input arrived from our primary */
+int repl_set_primary(const char *host, int port); /* become a replica */
+void repl_set_none(void);                         /* stop being a replica, keep the data */
+void repl_start_sync(client_t *c);                /* primary side of SYNC */
+void repl_info(buf_t *b);
 
 #endif

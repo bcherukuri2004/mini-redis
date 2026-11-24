@@ -3,6 +3,7 @@ import os
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -125,6 +126,8 @@ class Server:
         return Client(self.port)
 
     def stop(self, sig=signal.SIGTERM):
+        if getattr(self, "early_err", None) is not None:
+            return self.early_err
         if self.proc.poll() is None:
             self.proc.send_signal(sig)
         try:
@@ -145,15 +148,37 @@ def mini_binary():
     raise FileNotFoundError("build the server first: make")
 
 
-def start_mini(aof=None, fsync="everysec", port=None):
-    port = port or free_port()
-    argv = [mini_binary(), "--port", str(port)]
-    if aof:
-        argv += ["--aof", str(aof), "--fsync", fsync]
-    return Server(argv, port)
+def start_mini(aof=None, fsync="everysec", port=None, extra=()):
+    """Start a server. free_port() only finds a port that was free a moment
+    ago; another connection in the test can take it before the server binds
+    it. When the server exits saying so, try again (a new port if we picked
+    it, the same port a little later if the caller asked for that one)."""
+    fixed = port is not None
+    for attempt in range(20):
+        use = port if fixed else free_port()
+        argv = [mini_binary(), "--port", str(use)]
+        if aof:
+            argv += ["--aof", str(aof), "--fsync", fsync]
+        argv += list(extra)
+        srv = Server(argv, use)
+        if srv.alive:
+            return srv
+        err = srv.stop()
+        srv.early_err = err
+        if "cannot listen" not in err:
+            return srv  # a real startup failure; some tests expect these
+        with open(os.path.join(ROOT, ".port-retries.log"), "a") as f:
+            f.write("port %d attempt %d: %s\n" % (use, attempt, err.strip().splitlines()[-1]))
+        time.sleep(0.1)
+    return srv
 
 
 def start_real_redis():
+    """Real Redis in its own empty folder. Redis writes dump.rdb into its
+    folder when a replica asks it for a copy, and loads dump.rdb at startup,
+    so sharing a folder would leak keys from one test into the next."""
     port = free_port()
-    argv = ["redis-server", "--port", str(port), "--save", "", "--appendonly", "no", "--bind", "127.0.0.1"]
+    workdir = tempfile.mkdtemp(prefix="real-redis-")
+    argv = ["redis-server", "--port", str(port), "--save", "", "--appendonly", "no", "--bind", "127.0.0.1",
+            "--dir", workdir]
     return Server(argv, port)

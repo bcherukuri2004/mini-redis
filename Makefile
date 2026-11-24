@@ -1,8 +1,8 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -g
 WARN    := -std=gnu11 -Wall -Wextra -Wshadow -Wno-unused-parameter
-SRC     := src/util.c src/buf.c src/dict.c src/resp.c src/commands.c src/aof.c
-CORE    := src/util.c src/buf.c src/dict.c src/resp.c
+SRC     := src/util.c src/buf.c src/dict.c src/resp.c src/replproto.c src/commands.c src/aof.c src/repl.c
+CORE    := src/util.c src/buf.c src/dict.c src/resp.c src/replproto.c
 
 all: mini-redis
 
@@ -21,7 +21,7 @@ tests/unit: tests/unit.c $(CORE) src/*.h
 # all against the sanitizer build.
 test: tests/unit mini-redis-asan
 	./tests/unit
-	python3 -m pytest -q tests/test_integration.py tests/test_differential.py
+	python3 -m pytest -q tests/test_integration.py tests/test_differential.py tests/test_replication.py
 
 bench: mini-redis
 	python3 tests/bench.py
