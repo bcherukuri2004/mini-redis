@@ -1,0 +1,85 @@
+{
+  "machine": {
+    "cpus_in_vm": 4,
+    "pinned": true,
+    "runs_per_number": 3
+  },
+  "full_sync": {
+    "redis|10000": {
+      "wall_ms": 9.99791600042954
+    },
+    "redis|100000": {
+      "wall_ms": 100.72854200552683
+    },
+    "redis|1000000": {
+      "wall_ms": 1218.8496669987217
+    },
+    "mini|10000": {
+      "wall_ms": 7.144791990867816,
+      "replica_sync_ms": 5.705,
+      "primary_build_ms": 2.857
+    },
+    "mini|100000": {
+      "wall_ms": 62.40787499700673,
+      "replica_sync_ms": 60.996,
+      "primary_build_ms": 30.123
+    },
+    "mini|1000000": {
+      "wall_ms": 825.5027499981225,
+      "replica_sync_ms": 825.068,
+      "primary_build_ms": 351.975
+    }
+  },
+  "primary_set_rps": {
+    "redis|P1|alone": 185356.81,
+    "redis|P1|replica": 173988.69,
+    "redis|P16|alone": 1026167.25,
+    "redis|P16|replica": 761759.69,
+    "mini|P1|alone": 198019.8,
+    "mini|P1|replica": 198906.03,
+    "mini|P16|alone": 1730103.75,
+    "mini|P16|replica": 1107726.38
+  },
+  "lag_under_load": {
+    "redis|P1": {
+      "probes": 98,
+      "delay_ms_median": 0.06806249439250678,
+      "delay_ms_p99": 0.49229199066758156,
+      "delay_ms_max": 0.5127920012455434,
+      "gap_bytes_median": 3156.5,
+      "gap_bytes_max": 6634,
+      "catch_up_ms_after_load": 0.2701250050449744,
+      "load_rps": 197823.92
+    },
+    "redis|P16": {
+      "probes": 211,
+      "delay_ms_median": 0.4317909915698692,
+      "delay_ms_p99": 1.4780420024180785,
+      "delay_ms_max": 2.2086249955464154,
+      "gap_bytes_median": 85600.0,
+      "gap_bytes_max": 171200,
+      "catch_up_ms_after_load": 0.21787500008940697,
+      "load_rps": 845487.25
+    },
+    "mini|P1": {
+      "probes": 97,
+      "delay_ms_median": 0.05950000195298344,
+      "delay_ms_p99": 0.4849580000154674,
+      "delay_ms_max": 0.4849580000154674,
+      "gap_bytes_median": 1819,
+      "gap_bytes_max": 6634,
+      "catch_up_ms_after_load": 0.2102089929394424,
+      "load_rps": 202224.47
+    },
+    "mini|P16": {
+      "probes": 168,
+      "delay_ms_median": 0.1919170026667416,
+      "delay_ms_p99": 1.5130000101635233,
+      "delay_ms_max": 1.5950829983921722,
+      "gap_bytes_median": 85600.0,
+      "gap_bytes_max": 254339,
+      "catch_up_ms_after_load": 0.17262500477954745,
+      "load_rps": 1099203.12
+    }
+  }
+}
