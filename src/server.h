@@ -9,6 +9,7 @@
 #include "util.h"
 
 #define MINI_VERSION "0.1.0"
+#define MAX_REPLICAS 8 /* each one holds its own full copy while it syncs */
 
 typedef struct client {
     int fd; /* -1 for the fake client used to replay the append only file */

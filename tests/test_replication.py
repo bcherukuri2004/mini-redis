@@ -584,3 +584,47 @@ def test_replica_with_its_own_log_restarts_with_the_copied_data(tmp_path):
     rc.close()
     pc.close()
     stop_clean(r, p)
+
+
+# ---------------------------------------------------------------- limits (security review fixes)
+
+def test_too_many_replicas_are_refused():
+    p = start_mini()
+    pc = p.client()
+    pc.cmd("SET", "k", "v")
+    fakes = []
+    for _ in range(8):
+        f = Client(p.port)
+        f.send("SYNC")
+        assert f._line().startswith(b"+FULLSYNC ")
+        fakes.append(f)
+    ninth = Client(p.port)
+    assert ninth.cmd("SYNC") == Err("ERR too many replicas")
+    assert info(pc)["connected_slaves"] == "8"
+    # A slot frees up when one leaves.
+    fakes.pop().close()
+    wait_until(lambda: info(pc)["connected_slaves"] == "7", what="slot to free")
+    ninth.send("SYNC")
+    assert ninth._line().startswith(b"+FULLSYNC ")
+    for f in fakes + [ninth, pc]:
+        f.close()
+    stop_clean(p)
+
+
+def test_replica_connection_cannot_pile_up_replies():
+    # A connection that becomes a replica and then floods the server with
+    # reads it never collects is cut off by the replica limit as soon as its
+    # input is processed, not only at the next heartbeat.
+    p = start_mini(extra=["--replbuf", "1000000"])
+    pc = p.client()
+    pc.cmd("SET", "big", "x" * 500_000)
+    f = Client(p.port)
+    f.send("SYNC")
+    assert f._line().startswith(b"+FULLSYNC ")
+    f.sock.sendall(Client.encode("GET", "big") * 40)  # 20 MB of replies, never read
+    assert f.at_eof(wait=5)
+    assert p.alive
+    # It was the reply limit that closed it, not the slow replica check.
+    assert info(pc)["replicas_dropped_slow"] == "0"
+    pc.close()
+    stop_clean(p)

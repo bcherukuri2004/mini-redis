@@ -133,8 +133,9 @@ static void process_input(client_t *c) {
     }
     if (buf_used(&c->in) > RESP_MAX_BULK + (1u << 20)) client_close(c);
     if (c->closing) return;
-    /* A replica's output is limited separately, by repl_feed. */
-    if (!c->is_replica && buf_used(&c->out) > MAX_OUTPUT_BYTES) {
+    /* A replica connection gets the replica limit; it is also checked by
+     * repl_feed each time a change is queued. */
+    if (buf_used(&c->out) > (c->is_replica ? server.replbuf_limit : MAX_OUTPUT_BYTES)) {
         client_close(c);
         return;
     }

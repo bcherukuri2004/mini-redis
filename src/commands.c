@@ -400,6 +400,7 @@ static void cmd_sync(client_t *c, args_t *a) {
     if (server.repl_state != REPL_NONE)
         return reply_error(c, "ERR this server is a replica; chained replication is not supported");
     if (c->is_replica) return reply_error(c, "ERR already syncing");
+    if (server.nreplicas >= MAX_REPLICAS) return reply_error(c, "ERR too many replicas");
     repl_start_sync(c);
 }
 
